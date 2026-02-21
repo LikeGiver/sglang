@@ -359,6 +359,10 @@ class ServerArgs:
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
+    # Parallel module loading (opt-in to reduce cold-start latency)
+    enable_parallel_module_load: bool = False
+    parallel_module_load_workers: int = 4
+
     # Logging
     log_level: str = "info"
 
@@ -899,6 +903,21 @@ class ServerArgs:
         )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
+
+        # Parallel module loading
+        parser.add_argument(
+            "--enable-parallel-module-load",
+            action=StoreBoolean,
+            default=ServerArgs.enable_parallel_module_load,
+            help="Load independent pipeline modules (VAE, text encoder, etc.) in parallel using threads to reduce cold-start time. "
+            "Falls back to sequential loading on any failure.",
+        )
+        parser.add_argument(
+            "--parallel-module-load-workers",
+            type=int,
+            default=ServerArgs.parallel_module_load_workers,
+            help="Max worker threads for parallel module loading (only effective when --enable-parallel-module-load is set).",
+        )
 
         # Logging
         parser.add_argument(

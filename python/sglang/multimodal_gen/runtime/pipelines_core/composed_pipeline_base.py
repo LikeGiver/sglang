@@ -9,6 +9,7 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, cast
 
 import torch
@@ -249,7 +250,9 @@ class ComposedPipelineBase(ABC):
         required_modules = self.required_config_modules
         logger.info("Loading required components: %s", required_modules)
 
-        loaded_components = {}
+        loaded_components: dict[str, Any] = {}
+        load_specs: list[tuple[str, str, str]] = []
+
         for module_name, (
             transformers_or_diffusers,
             architecture,
@@ -289,18 +292,68 @@ class ComposedPipelineBase(ABC):
                 )
             else:
                 component_model_path = os.path.join(self.model_path, load_module_name)
+
+            load_specs.append(
+                (module_name, load_module_name, component_model_path)
+            )
+
+        def _load_one(spec: tuple[str, str, str]):
+            module_name, load_module_name, component_model_path = spec
+            transformers_or_diffusers, _ = model_index[module_name]
             module, memory_usage = PipelineComponentLoader.load_component(
                 component_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
             )
+            return module_name, load_module_name, module, memory_usage
 
+        def _apply_loaded_result(module_name, load_module_name, module, memory_usage):
             self.memory_usages[load_module_name] = memory_usage
-
             if module_name in loaded_components:
                 logger.warning("Overwriting module %s", module_name)
             loaded_components[module_name] = module
+
+        parallel_enabled = (
+            server_args.enable_parallel_module_load and len(load_specs) > 1
+        )
+
+        if parallel_enabled:
+            workers = max(
+                1,
+                min(server_args.parallel_module_load_workers, len(load_specs)),
+            )
+            logger.info(
+                "Parallel module loading enabled with %d workers for %d modules",
+                workers,
+                len(load_specs),
+            )
+
+            try:
+                results_by_module = {}
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    future_to_module = {
+                        executor.submit(_load_one, spec): spec[0] for spec in load_specs
+                    }
+                    for future in as_completed(future_to_module):
+                        module_name = future_to_module[future]
+                        results_by_module[module_name] = future.result()
+
+                # Deterministic apply order by required module list.
+                for module_name in required_modules:
+                    if module_name in results_by_module:
+                        _apply_loaded_result(*results_by_module[module_name])
+
+            except Exception as e:
+                logger.warning(
+                    "Parallel module loading failed (%s). Falling back to sequential loading.",
+                    e,
+                )
+                for spec in load_specs:
+                    _apply_loaded_result(*_load_one(spec))
+        else:
+            for spec in load_specs:
+                _apply_loaded_result(*_load_one(spec))
 
         # Check if all required modules were loaded
         for module_name in required_modules:
