@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
     component_name_to_loader_cls,
+    get_phase_timings,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -325,6 +326,9 @@ class PipelineComponentLoader:
             component_model_path: Path to the component model
             transformers_or_diffusers: Whether the component is from transformers or diffusers
 
+        Returns:
+            tuple: (component, memory_consumed, phase_timings)
+                phase_timings is a list of (phase_name, abs_start, abs_end) tuples.
         """
 
         # Get the appropriate loader for this component type
@@ -333,13 +337,17 @@ class PipelineComponentLoader:
         )
 
         try:
+            # Clear any stale phase timings on this thread
+            get_phase_timings()
             # Load the component
-            return loader.load(
+            component, consumed = loader.load(
                 component_model_path,
                 server_args,
                 component_name,
                 transformers_or_diffusers,
             )
+            phase_timings = get_phase_timings()
+            return component, consumed, phase_timings
         except Exception as e:
             logger.error(
                 f"Error while loading component: {component_name}, {component_model_path=}"

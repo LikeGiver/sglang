@@ -7,6 +7,8 @@ import contextlib
 import glob
 import os
 import re
+import threading
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from typing import Any, Dict, Type
@@ -181,3 +183,87 @@ BYTES_PER_GB = 1024**3
 
 # component name ->  ComponentLoader class
 component_name_to_loader_cls: Dict[str, Type[Any]] = {}
+
+# ---------------------------------------------------------------------------
+# Locks for parallel module loading
+# ---------------------------------------------------------------------------
+# Serialises model construction (meta-device init, skip_init_modules, etc.)
+# because PyTorch module construction is NOT thread-safe (global dtype state,
+# monkey-patched reset_parameters, etc.).
+_model_construction_lock = threading.Lock()
+
+# Serialises host-to-device transfers so that only one large cudaMemcpyAsync
+# flight is in progress at a time, avoiding PCIe bandwidth contention.
+_h2d_lock = threading.Semaphore(1)
+
+# ---------------------------------------------------------------------------
+# Per-thread phase timing recorder
+# ---------------------------------------------------------------------------
+# Each loading thread gets its own list of (phase_name, start, end) tuples.
+# The loaders call ``record_phase()`` around each phase; the orchestrator
+# calls ``get_phase_timings()`` / ``reset_phase_timings()`` to collect them.
+_phase_tls = threading.local()
+
+
+def record_phase(phase_name: str):
+    """Context manager that records wall-clock start/end for *phase_name*.
+
+    Timings are stored as absolute ``time.perf_counter()`` values so the
+    caller in ``composed_pipeline_base`` can re-base them relative to its
+    own T0.
+    """
+    return _PhaseRecorder(phase_name)
+
+
+class _PhaseRecorder:
+    __slots__ = ("_name", "_start")
+
+    def __init__(self, name: str):
+        self._name = name
+        self._start = 0.0
+
+    def __enter__(self):
+        if not hasattr(_phase_tls, "timings"):
+            _phase_tls.timings = []
+        self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        end = time.perf_counter()
+        _phase_tls.timings.append((self._name, self._start, end))
+        return False
+
+
+def get_phase_timings() -> list[tuple[str, float, float]]:
+    """Return and clear the phase timings accumulated on the current thread."""
+    timings = getattr(_phase_tls, "timings", [])
+    _phase_tls.timings = []
+    return timings
+
+
+def _transfer_to_device(
+    model: nn.Module,
+    device: torch.device,
+    non_blocking: bool = True,
+) -> nn.Module:
+    """Move *model* to *device* under the H2D semaphore.
+
+    When parallel loading is active, multiple threads may try to push
+    weights to the GPU simultaneously.  Holding ``_h2d_lock`` ensures
+    only one large transfer is in flight at a time, preventing PCIe
+    bandwidth contention.
+
+    For CPU-only transfers the lock is skipped (no PCIe contention).
+
+    For single-threaded (sequential) loading the semaphore is always
+    free so this is effectively a no-op wrapper around ``.to()``.
+    """
+    needs_gpu_lock = device.type == "cuda"
+    with record_phase("h2d_transfer"):
+        if needs_gpu_lock:
+            with _h2d_lock:
+                model = model.to(device=device, non_blocking=non_blocking)
+                torch.cuda.synchronize(device)
+        else:
+            model = model.to(device=device)
+    return model

@@ -6,6 +6,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
+    _model_construction_lock,
+    _transfer_to_device,
+    record_phase,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -52,21 +55,28 @@ class AdapterLoader(ComponentLoader):
 
         from types import SimpleNamespace
 
-        with set_default_torch_dtype(default_dtype), skip_init_modules():
-            connector_cfg = SimpleNamespace(**config)
-            model = model_cls(connector_cfg).to(
-                device=target_device, dtype=default_dtype
-            )
+        # Phase 1: Model construction (thread-safe via lock)
+        with record_phase("construction"):
+            with _model_construction_lock:
+                with set_default_torch_dtype(default_dtype), skip_init_modules():
+                    connector_cfg = SimpleNamespace(**config)
+                    model = model_cls(connector_cfg)
 
-        safetensors_list = _list_safetensors_files(component_model_path)
-        if not safetensors_list:
-            raise ValueError(f"No safetensors files found in {component_model_path}")
-        if len(safetensors_list) != 1:
-            raise ValueError(
-                f"Found {len(safetensors_list)} safetensors files in {component_model_path}, expected 1"
-            )
+        # Phase 2: Disk I/O (no lock – safetensors read releases GIL)
+        with record_phase("disk_io"):
+            safetensors_list = _list_safetensors_files(component_model_path)
+            if not safetensors_list:
+                raise ValueError(f"No safetensors files found in {component_model_path}")
+            if len(safetensors_list) != 1:
+                raise ValueError(
+                    f"Found {len(safetensors_list)} safetensors files in {component_model_path}, expected 1"
+                )
 
-        loaded = safetensors_load_file(safetensors_list[0])
-        model.load_state_dict(loaded, strict=False)
+            loaded = safetensors_load_file(safetensors_list[0])
+            model.load_state_dict(loaded, strict=False)
+
+        # Phase 3: H2D transfer (serialised via semaphore)
+        model = _transfer_to_device(model, target_device)
+        model = model.to(dtype=default_dtype)
 
         return model

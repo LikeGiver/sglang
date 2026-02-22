@@ -359,6 +359,9 @@ class ServerArgs:
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
+    # Parallel module loading
+    parallel_loading: bool = True
+
     # Logging
     log_level: str = "info"
 
@@ -828,6 +831,14 @@ class ServerArgs:
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
+        )
+        parser.add_argument(
+            "--parallel-loading",
+            action=StoreBoolean,
+            default=ServerArgs.parallel_loading,
+            help="Load pipeline modules in parallel using threads. "
+            "Overlaps disk I/O across components for faster startup. "
+            "Use --parallel-loading false to disable.",
         )
 
         # Nunchaku SVDQuant quantization parameters

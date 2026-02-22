@@ -8,7 +8,9 @@ This module defines the base class for pipelines that are composed of multiple s
 """
 
 import os
+import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, cast
 
 import torch
@@ -86,6 +88,10 @@ class ComposedPipelineBase(ABC):
 
         # [module_name, gpu memory usage]
         self.memory_usages: dict[str, float] = {}
+        # [module_name, (start_time, end_time)] relative to load start
+        self.load_timings: dict[str, tuple[float, float]] = {}
+        # [module_name, [(phase_name, start, end), ...]] relative to load start
+        self.phase_timings: dict[str, list[tuple[str, float, float]]] = {}
         # Load modules directly in initialization
         logger.info("Loading pipeline modules...")
         self.modules = self.load_modules(server_args, loaded_modules)
@@ -250,10 +256,17 @@ class ComposedPipelineBase(ABC):
         logger.info("Loading required components: %s", required_modules)
 
         loaded_components = {}
+
+        # Pre-pass: resolve paths and handle null entries / already-provided modules.
+        # This part mutates self (e.g. removing null modules from required list) so
+        # it must run sequentially before any parallel work.
+        to_load: list[
+            tuple[str, str, str, str]
+        ] = []  # (module_name, load_module_name, component_model_path, transformers_or_diffusers)
         for module_name, (
             transformers_or_diffusers,
             architecture,
-        ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
+        ) in model_index.items():
             if transformers_or_diffusers is None:
                 logger.warning(
                     "Module %s in model_index.json has null value, removing from required_config_modules",
@@ -270,16 +283,15 @@ class ComposedPipelineBase(ABC):
                 loaded_components[module_name] = loaded_modules[module_name]
                 continue
 
-            # we load the module from the extra config module map if it exists
+            # Resolve the load name (may differ via extra config module map)
             if module_name in self._extra_config_module_map:
                 load_module_name = self._extra_config_module_map[module_name]
             else:
                 load_module_name = module_name
 
-            # Use custom VAE path if provided, otherwise use default path
+            # Resolve model path
             if module_name == "vae" and server_args.vae_path is not None:
                 component_model_path = server_args.vae_path
-                # Download from HuggingFace Hub if path doesn't exist locally
                 if not os.path.exists(component_model_path):
                     component_model_path = maybe_download_model(component_model_path)
                 logger.info(
@@ -289,20 +301,90 @@ class ComposedPipelineBase(ABC):
                 )
             else:
                 component_model_path = os.path.join(self.model_path, load_module_name)
-            module, memory_usage = PipelineComponentLoader.load_component(
+
+            to_load.append(
+                (
+                    module_name,
+                    load_module_name,
+                    component_model_path,
+                    transformers_or_diffusers,
+                )
+            )
+
+        load_t0 = time.perf_counter()
+
+        def _load_one(
+            module_name: str,
+            load_module_name: str,
+            component_model_path: str,
+            transformers_or_diffusers: str,
+        ):
+            """Load a single component. Returns (module_name, load_module_name, module, memory_usage, t_start, t_end, phase_timings)."""
+            t_start = time.perf_counter() - load_t0
+            module, memory_usage, raw_phases = PipelineComponentLoader.load_component(
                 component_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
             )
+            t_end = time.perf_counter() - load_t0
+            # Re-base absolute phase timestamps relative to load_t0
+            phases = [
+                (name, abs_start - load_t0, abs_end - load_t0)
+                for name, abs_start, abs_end in raw_phases
+            ]
+            return module_name, load_module_name, module, memory_usage, t_start, t_end, phases
 
-            self.memory_usages[load_module_name] = memory_usage
+        use_parallel = getattr(server_args, "parallel_loading", False) and len(to_load) > 1
 
-            if module_name in loaded_components:
-                logger.warning("Overwriting module %s", module_name)
-            loaded_components[module_name] = module
+        if use_parallel:
+            logger.info(
+                "Loading %d modules in parallel (threads=%d)",
+                len(to_load),
+                len(to_load),
+            )
+            with ThreadPoolExecutor(max_workers=len(to_load)) as pool:
+                futures = {
+                    pool.submit(_load_one, *args): args[0] for args in to_load
+                }
+                # Use tqdm to show progress
+                with tqdm(
+                    total=len(futures),
+                    desc="Loading required modules (parallel)",
+                ) as pbar:
+                    for future in as_completed(futures):
+                        module_name, load_module_name, module, memory_usage, t_start, t_end, phases = (
+                            future.result()
+                        )
+                        self.memory_usages[load_module_name] = memory_usage
+                        self.load_timings[load_module_name] = (t_start, t_end)
+                        self.phase_timings[load_module_name] = phases
+                        if module_name in loaded_components:
+                            logger.warning("Overwriting module %s", module_name)
+                        loaded_components[module_name] = module
+                        pbar.update(1)
+        else:
+            # Sequential loading (original path)
+            for (
+                module_name,
+                load_module_name,
+                component_model_path,
+                transformers_or_diffusers,
+            ) in tqdm(iterable=to_load, desc="Loading required modules"):
+                module_name, load_module_name, module, memory_usage, t_start, t_end, phases = _load_one(
+                    module_name,
+                    load_module_name,
+                    component_model_path,
+                    transformers_or_diffusers,
+                )
+                self.memory_usages[load_module_name] = memory_usage
+                self.load_timings[load_module_name] = (t_start, t_end)
+                self.phase_timings[load_module_name] = phases
+                if module_name in loaded_components:
+                    logger.warning("Overwriting module %s", module_name)
+                loaded_components[module_name] = module
 
-        # Check if all required modules were loaded
+        # Post-pass: validate all required modules were loaded
         for module_name in required_modules:
             if (
                 module_name not in loaded_components

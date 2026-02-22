@@ -11,7 +11,11 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _h2d_lock,
     _list_safetensors_files,
+    _model_construction_lock,
+    _transfer_to_device,
+    record_phase,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -100,13 +104,17 @@ class VAELoader(ComponentLoader):
             spec.loader.exec_module(custom_module)
             vae_cls = getattr(custom_module, cls_name)
             vae_dtype = PRECISION_TO_TYPE[vae_precision]
-            with set_default_torch_dtype(vae_dtype):
-                vae = vae_cls.from_pretrained(
-                    component_model_path,
-                    revision=server_args.revision,
-                    trust_remote_code=server_args.trust_remote_code,
-                )
-            vae = vae.to(device=target_device, dtype=vae_dtype)
+            # from_pretrained handles construction + weight loading internally
+            with record_phase("construction+disk_io"):
+                with _model_construction_lock:
+                    with set_default_torch_dtype(vae_dtype):
+                        vae = vae_cls.from_pretrained(
+                            component_model_path,
+                            revision=server_args.revision,
+                            trust_remote_code=server_args.trust_remote_code,
+                        )
+            vae = _transfer_to_device(vae, target_device)
+            vae = vae.to(dtype=vae_dtype)
             if (
                 component_name in ("vae", "video_vae")
                 and torch.cuda.is_available()
@@ -119,20 +127,24 @@ class VAELoader(ComponentLoader):
                     )
             return vae
 
-        # Load from ModelRegistry (standard VAE classes)
-        with (
-            set_default_torch_dtype(PRECISION_TO_TYPE[vae_precision]),
-            skip_init_modules(),
-        ):
-            vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-            vae = vae_cls(vae_config).to(target_device)
+        # Phase 1: Model construction (thread-safe via lock)
+        with record_phase("construction"):
+            with _model_construction_lock:
+                with (
+                    set_default_torch_dtype(PRECISION_TO_TYPE[vae_precision]),
+                    skip_init_modules(),
+                ):
+                    vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+                    vae = vae_cls(vae_config)
 
-        safetensors_list = _list_safetensors_files(component_model_path)
-        assert (
-            len(safetensors_list) == 1
-        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
-        loaded = safetensors_load_file(safetensors_list[0])
-        vae.load_state_dict(loaded, strict=False)
+        # Phase 2: Disk I/O (no lock – safetensors read releases GIL)
+        with record_phase("disk_io"):
+            safetensors_list = _list_safetensors_files(component_model_path)
+            assert (
+                len(safetensors_list) == 1
+            ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
+            loaded = safetensors_load_file(safetensors_list[0])
+            vae.load_state_dict(loaded, strict=False)
 
         state_keys = set(vae.state_dict().keys())
         loaded_keys = set(loaded.keys())
@@ -142,6 +154,9 @@ class VAELoader(ComponentLoader):
             logger.warning("VAE missing keys: %s", missing_keys)
         if unexpected_keys:
             logger.warning("VAE unexpected keys: %s", unexpected_keys)
+
+        # Phase 3: H2D transfer (serialised via semaphore)
+        vae = _transfer_to_device(vae, target_device)
 
         if (
             component_name in ("vae", "video_vae")

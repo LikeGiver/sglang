@@ -19,6 +19,8 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
     _normalize_component_type,
 )
+
+# Note: locks for parallel loading are applied inside maybe_load_fsdp_model()
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (

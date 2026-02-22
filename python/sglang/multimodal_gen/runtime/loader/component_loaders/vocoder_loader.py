@@ -6,6 +6,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
+    _model_construction_lock,
+    _transfer_to_device,
+    record_phase,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -56,16 +59,24 @@ class VocoderLoader(ComponentLoader):
         should_offload = self.should_offload(server_args)
         target_device = self.target_device(should_offload)
 
-        with set_default_torch_dtype(vocoder_dtype), skip_init_modules():
-            vocoder_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-            vocoder = vocoder_cls(vocoder_config).to(target_device)
+        # Phase 1: Model construction (thread-safe via lock)
+        with record_phase("construction"):
+            with _model_construction_lock:
+                with set_default_torch_dtype(vocoder_dtype), skip_init_modules():
+                    vocoder_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+                    vocoder = vocoder_cls(vocoder_config)
 
-        safetensors_list = _list_safetensors_files(component_model_path)
-        assert (
-            len(safetensors_list) == 1
-        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
-        loaded = safetensors_load_file(safetensors_list[0])
-        incompatible = vocoder.load_state_dict(loaded, strict=False)
+        # Phase 2: Disk I/O (no lock – safetensors read releases GIL)
+        with record_phase("disk_io"):
+            safetensors_list = _list_safetensors_files(component_model_path)
+            assert (
+                len(safetensors_list) == 1
+            ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
+            loaded = safetensors_load_file(safetensors_list[0])
+            incompatible = vocoder.load_state_dict(loaded, strict=False)
+
+        # Phase 3: H2D transfer (serialised via semaphore)
+        vocoder = _transfer_to_device(vocoder, target_device)
         missing_keys = []
         unexpected_keys = []
         try:

@@ -23,8 +23,11 @@ from torch.distributed.fsdp import (
 from torch.nn.modules.module import _IncompatibleKeys
 
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _h2d_lock,
+    _model_construction_lock,
     get_param_names_mapping,
     hf_to_custom_state_dict,
+    record_phase,
     set_default_torch_dtype,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
@@ -92,50 +95,60 @@ def maybe_load_fsdp_model(
         mp_policy=mp_policy,
     )
 
-    with set_default_torch_dtype(default_torch_dtype), torch.device("meta"):
-        model = model_cls(**init_params)
+    # Phase 1: Model construction on meta device (thread-safe via lock)
+    with record_phase("construction"):
+        with _model_construction_lock:
+            with set_default_torch_dtype(default_torch_dtype), torch.device("meta"):
+                model = model_cls(**init_params)
 
-    # Check if we should use FSDP
-    use_fsdp = fsdp_inference
+            # Check if we should use FSDP
+            use_fsdp = fsdp_inference
 
-    # Disable FSDP for MPS as it's not compatible
-    if current_platform.is_mps():
-        use_fsdp = False
-        logger.info("Disabling FSDP for MPS platform as it's not compatible")
+            # Disable FSDP for MPS as it's not compatible
+            if current_platform.is_mps():
+                use_fsdp = False
+                logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
-    if use_fsdp:
-        world_size = hsdp_replicate_dim * hsdp_shard_dim
-        if not fsdp_inference:
-            hsdp_replicate_dim = world_size
-            hsdp_shard_dim = 1
+            if use_fsdp:
+                world_size = hsdp_replicate_dim * hsdp_shard_dim
+                if not fsdp_inference:
+                    hsdp_replicate_dim = world_size
+                    hsdp_shard_dim = 1
 
-        device_mesh = init_device_mesh(
-            current_platform.device_type,
-            # (Replicate(), Shard(dim=0))
-            mesh_shape=(hsdp_replicate_dim, hsdp_shard_dim),
-            mesh_dim_names=("replicate", "shard"),
-        )
-        shard_model(
-            model,
-            cpu_offload=cpu_offload,
-            reshard_after_forward=True,
-            mp_policy=mp_policy,
-            mesh=device_mesh,
-            fsdp_shard_conditions=model._fsdp_shard_conditions,
-            pin_cpu_memory=pin_cpu_memory,
-        )
+                device_mesh = init_device_mesh(
+                    current_platform.device_type,
+                    # (Replicate(), Shard(dim=0))
+                    mesh_shape=(hsdp_replicate_dim, hsdp_shard_dim),
+                    mesh_dim_names=("replicate", "shard"),
+                )
+                shard_model(
+                    model,
+                    cpu_offload=cpu_offload,
+                    reshard_after_forward=True,
+                    mp_policy=mp_policy,
+                    mesh=device_mesh,
+                    fsdp_shard_conditions=model._fsdp_shard_conditions,
+                    pin_cpu_memory=pin_cpu_memory,
+                )
 
-    weight_iterator = safetensors_weights_iterator(weight_dir_list)
-    param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
-    load_model_from_full_model_state_dict(
-        model,
-        weight_iterator,
-        device,
-        param_dtype,
-        strict=strict,
-        cpu_offload=cpu_offload,
-        param_names_mapping=param_names_mapping_fn,
-    )
+    # Phase 2: Disk I/O (no lock – safetensors read releases GIL)
+    with record_phase("disk_io"):
+        weight_iterator = safetensors_weights_iterator(weight_dir_list)
+        param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+
+    # Phase 3: H2D transfer happens inside load_model_from_full_model_state_dict
+    # (individual tensors are moved to device)
+    with record_phase("h2d_transfer"):
+        with _h2d_lock:
+            load_model_from_full_model_state_dict(
+                model,
+                weight_iterator,
+                device,
+                param_dtype,
+                strict=strict,
+                cpu_offload=cpu_offload,
+                param_names_mapping=param_names_mapping_fn,
+            )
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:
             raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")
